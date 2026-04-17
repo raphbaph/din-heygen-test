@@ -1,0 +1,274 @@
+:root {
+  color-scheme: light;
+  font-family: "Instrument Sans", "Avenir Next", "Segoe UI", sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color: oklch(21% 0.03 230);
+  background:
+    radial-gradient(circle at top left, oklch(94% 0.05 95), transparent 30%),
+    radial-gradient(circle at top right, oklch(92% 0.04 210), transparent 26%),
+    linear-gradient(180deg, oklch(97% 0.01 90), oklch(93% 0.02 85));
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  border: none;
+  cursor: pointer;
+}
+
+.shell {
+  width: min(1200px, calc(100vw - 32px));
+  margin: 0 auto;
+  padding: clamp(24px, 3vw, 40px) 0 40px;
+}
+
+.output-shell {
+  position: fixed;
+  inset: 0;
+  background: #000;
+  overflow: hidden;
+}
+
+.output-video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: #000;
+}
+
+.output-overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  gap: 8px;
+  padding: 24px;
+  text-align: center;
+  color: oklch(96% 0.01 95);
+  background: rgba(0, 0, 0, 0.58);
+}
+
+.output-status {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.output-meta {
+  margin: 0;
+  opacity: 0.82;
+  font-size: 0.9rem;
+}
+
+
+.hero {
+  display: grid;
+  grid-template-columns: 1.1fr 0.9fr;
+  gap: clamp(20px, 3vw, 36px);
+  align-items: end;
+  margin-bottom: 28px;
+}
+
+.hero-copy h1 {
+  margin: 0;
+  max-width: 10ch;
+  font-size: clamp(3.1rem, 7vw, 5.8rem);
+  line-height: 0.92;
+  letter-spacing: -0.05em;
+}
+
+.eyebrow {
+  margin: 0 0 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  font-size: 0.74rem;
+  color: oklch(42% 0.08 230);
+}
+
+.lede {
+  max-width: 54ch;
+  margin: 18px 0 0;
+  font-size: 1.02rem;
+  color: oklch(34% 0.03 230);
+}
+
+.join-panel,
+.transcript-panel {
+  background: color-mix(in oklch, oklch(99% 0.01 95) 80%, oklch(95% 0.03 210));
+  border: 1px solid oklch(83% 0.03 90);
+  border-radius: 28px;
+  box-shadow: 0 18px 50px rgba(73, 57, 32, 0.08);
+}
+
+.join-panel {
+  padding: 22px;
+}
+
+.field {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.field span,
+.entry-speaker,
+.status-line strong,
+.frame-label {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+.field input {
+  width: 100%;
+  padding: 14px 16px;
+  border-radius: 16px;
+  border: 1px solid oklch(81% 0.03 90);
+  background: oklch(99% 0.01 95);
+}
+
+.join-panel button {
+  width: 100%;
+  padding: 15px 18px;
+  border-radius: 999px;
+  background: oklch(55% 0.17 48);
+  color: oklch(98% 0.01 95);
+  transition: transform 180ms ease, opacity 180ms ease;
+}
+
+.join-panel button:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+.join-panel button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.status-stack {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.status-line,
+.error-line,
+.entry p,
+.transcript-header p {
+  margin: 0;
+}
+
+.error-line {
+  color: oklch(53% 0.19 30);
+}
+
+.stage {
+  display: grid;
+  grid-template-columns: 1.1fr 0.9fr;
+  gap: clamp(20px, 3vw, 36px);
+}
+
+.video-frame {
+  position: relative;
+  min-height: 540px;
+  overflow: hidden;
+  border-radius: 34px;
+  background:
+    linear-gradient(180deg, rgba(23, 35, 50, 0.18), rgba(17, 22, 29, 0.08)),
+    linear-gradient(135deg, oklch(80% 0.05 215), oklch(92% 0.04 85));
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.5);
+}
+
+.video-frame video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.frame-label {
+  position: absolute;
+  top: 18px;
+  left: 18px;
+  padding: 9px 12px;
+  border-radius: 999px;
+  background: rgba(255, 252, 247, 0.74);
+  backdrop-filter: blur(12px);
+}
+
+.transcript-panel {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  min-height: 540px;
+}
+
+.transcript-header {
+  padding: 22px 22px 16px;
+  border-bottom: 1px solid oklch(88% 0.02 90);
+}
+
+.transcript-header h2 {
+  margin: 0 0 6px;
+  font-size: 1.15rem;
+}
+
+.transcript-list {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  overflow: auto;
+  padding: 16px 22px 22px;
+}
+
+.entry {
+  padding: 14px 16px;
+  border-radius: 18px;
+}
+
+.entry-system {
+  background: oklch(95% 0.02 215);
+}
+
+.entry-avatar {
+  background: oklch(92% 0.06 70);
+}
+
+.entry-user {
+  background: oklch(95% 0.04 155);
+}
+
+.empty-copy {
+  color: oklch(46% 0.03 230);
+}
+
+@media (max-width: 920px) {
+  .hero,
+  .stage {
+    grid-template-columns: 1fr;
+  }
+
+  .video-frame,
+  .transcript-panel {
+    min-height: 420px;
+  }
+
+  .shell {
+    width: min(100vw - 20px, 1200px);
+  }
+}
