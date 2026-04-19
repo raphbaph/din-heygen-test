@@ -116,12 +116,14 @@ function OperatorPage() {
 function BotOutputPage() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const sessionRef = useRef<LiveAvatarSession | null>(null);
-  const recallTranscriptSocketRef = useRef<WebSocket | null>(null);
-  const conversationIdRef = useRef(crypto.randomUUID());
-  const processedTranscriptKeysRef = useRef(new Set<string>());
+  const transcriptEventSourceRef = useRef<EventSource | null>(null);
   const ignoreTranscriptsUntilRef = useRef(0);
   const isAvatarTalkingRef = useRef(false);
-  const isChatRequestPendingRef = useRef(false);
+  const queuedAvatarRepliesRef = useRef<ChatReplyEvent["data"][]>([]);
+  const launchId = useMemo(
+    () => new URLSearchParams(window.location.search).get("launchId"),
+    []
+  );
 
   const [sessionState, setSessionState] = useState(SessionState.INACTIVE);
   const [isStreamReady, setIsStreamReady] = useState(false);
@@ -213,7 +215,7 @@ function BotOutputPage() {
 
     return () => {
       cancelled = true;
-      recallTranscriptSocketRef.current?.close();
+      transcriptEventSourceRef.current?.close();
       sessionRef.current?.removeAllListeners();
       if (sessionRef.current?.state === SessionState.CONNECTED) {
         void sessionRef.current.stop();
@@ -230,49 +232,58 @@ function BotOutputPage() {
   }, [isStreamReady]);
 
   useEffect(() => {
-    if (!isStreamReady) {
+    if (!launchId) {
+      setErrorMessage("Missing Recall launchId in bot output URL.");
+      setStatusMessage("Transcript setup failed.");
+      setLastDebugMessage("Cannot subscribe to Recall transcript events without launchId.");
       return;
     }
 
-    const socket = new WebSocket("wss://meeting-data.bot.recall.ai/api/v1/transcript");
-    recallTranscriptSocketRef.current = socket;
+    const eventSource = new EventSource(
+      `/api/transcript-events?launchId=${encodeURIComponent(launchId)}`
+    );
+    transcriptEventSourceRef.current = eventSource;
 
-    socket.onopen = () => {
+    eventSource.onopen = () => {
       setStatusMessage("Waiting for finalized speech from the meeting.");
-      setLastDebugMessage("Recall transcript websocket connected.");
+      setLastDebugMessage("Recall transcript event stream connected.");
     };
 
-    socket.onmessage = (event) => {
+    eventSource.onmessage = (event) => {
       void handleTranscriptEvent(event.data);
     };
 
-    socket.onerror = () => {
+    eventSource.onerror = () => {
       setErrorMessage("Recall transcript stream failed.");
       setStatusMessage("Recall transcript stream failed.");
-      setLastDebugMessage("Recall transcript websocket error.");
-    };
-
-    socket.onclose = () => {
-      if (recallTranscriptSocketRef.current === socket) {
-        recallTranscriptSocketRef.current = null;
-      }
+      setLastDebugMessage("Recall transcript event stream error.");
     };
 
     return () => {
-      if (recallTranscriptSocketRef.current === socket) {
-        recallTranscriptSocketRef.current = null;
+      if (transcriptEventSourceRef.current === eventSource) {
+        transcriptEventSourceRef.current = null;
       }
-      socket.close();
+      eventSource.close();
     };
-  }, [isStreamReady]);
+  }, [launchId]);
 
   async function handleTranscriptEvent(rawMessage: string) {
-    let payload: RecallTranscriptSocketMessage;
+    let payload: StreamEvent;
 
     try {
-      payload = JSON.parse(rawMessage) as RecallTranscriptSocketMessage;
+      payload = JSON.parse(rawMessage) as StreamEvent;
     } catch (error) {
       console.error("Recall transcript payload parse failed", error);
+      return;
+    }
+
+    if (payload.event === "ready") {
+      setLastDebugMessage("Recall transcript event stream ready.");
+      return;
+    }
+
+    if (payload.event === "chat.reply") {
+      await handleChatReplyEvent(payload);
       return;
     }
 
@@ -284,50 +295,14 @@ function BotOutputPage() {
     setLastTranscriptPreview(
       `${transcriptEvent.participantName ?? "unknown"}: ${transcriptEvent.text || "[empty]"}`
     );
-
-    if (transcriptEvent.event === "transcript.partial_data") {
-      setLastDebugMessage(`Observed partial transcript update for ${transcriptEvent.key}.`);
-      return;
-    }
-
-    if (transcriptEvent.event !== "transcript.data") {
-      setLastDebugMessage(`Ignored unsupported transcript event ${transcriptEvent.event}.`);
-      return;
-    }
-
-    if (processedTranscriptKeysRef.current.has(transcriptEvent.key)) {
-      setLastDebugMessage(`Ignored duplicate finalized transcript ${transcriptEvent.key}.`);
-      return;
-    }
-
-    if (isAvatarTalkingRef.current || isChatRequestPendingRef.current) {
-      setLastDebugMessage("Ignored transcript while avatar was speaking or request was pending.");
-      return;
-    }
-
-    if (Date.now() < ignoreTranscriptsUntilRef.current) {
-      setLastDebugMessage("Ignored transcript during post-speech cooldown window.");
-      return;
-    }
-
-    const text = transcriptEvent.text.trim();
-    if (!text) {
-      setLastDebugMessage("Ignored empty finalized transcript.");
-      return;
-    }
-
-    processedTranscriptKeysRef.current.add(transcriptEvent.key);
-    appendTranscript("user", text);
     setLastDebugMessage(
-      `Accepted finalized transcript ${transcriptEvent.key}: "${text}"`
+      transcriptEvent.event === "transcript.partial_data"
+        ? `Observed partial transcript update ${transcriptEvent.id ?? "unknown"}.`
+        : `Observed finalized transcript ${transcriptEvent.id ?? "unknown"}.`
     );
-    await requestAvatarReply(text);
   }
 
   async function speakAsAvatar(text: string) {
-    appendTranscript("avatar", text);
-    setLastChatReplyText(text);
-
     const session = sessionRef.current;
     if (!session) {
       setLastDebugMessage("Avatar session was missing before speak.");
@@ -346,42 +321,46 @@ function BotOutputPage() {
       setLastDebugMessage("HeyGen avatar speak failed.");
     } finally {
       setStatusMessage("Waiting for finalized speech from the meeting.");
+      void flushQueuedAvatarReplies();
     }
   }
 
-  async function requestAvatarReply(text: string) {
-    isChatRequestPendingRef.current = true;
-    setStatusMessage("Thinking about a reply.");
-    setLastChatRequestText(text);
-    setLastDebugMessage("Sending transcript to /api/chat.");
+  async function handleChatReplyEvent(payload: ChatReplyEvent) {
+    appendTranscript("user", payload.data.userText);
+    setLastChatRequestText(payload.data.userText);
+    setLastChatReplyText(payload.data.reply);
 
-    try {
-      const response = await fetch("/api/chat", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          conversationId: conversationIdRef.current,
-          text
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error(await response.text());
-      }
-
-      const payload = (await response.json()) as { reply: string };
-      setLastDebugMessage("Received reply from /api/chat.");
-      await speakAsAvatar(payload.reply);
-    } catch (error) {
-      console.error("Chat request failed", error);
-      setErrorMessage(error instanceof Error ? error.message : "Chat request failed.");
-      setLastDebugMessage("Chat request failed.");
-      await speakAsAvatar("I missed part of that. Please say it once more.");
-    } finally {
-      isChatRequestPendingRef.current = false;
+    if (isAvatarTalkingRef.current || Date.now() < ignoreTranscriptsUntilRef.current) {
+      queuedAvatarRepliesRef.current.push(payload.data);
+      setLastDebugMessage(
+        `Queued avatar reply for transcript ${payload.data.transcriptId} while avatar was busy.`
+      );
+      return;
     }
+
+    setLastDebugMessage(
+      `Speaking server reply for transcript ${payload.data.transcriptId}.`
+    );
+    appendTranscript("avatar", payload.data.reply);
+    await speakAsAvatar(payload.data.reply);
+  }
+
+  async function flushQueuedAvatarReplies() {
+    if (isAvatarTalkingRef.current || Date.now() < ignoreTranscriptsUntilRef.current) {
+      return;
+    }
+
+    const nextReply = queuedAvatarRepliesRef.current.shift();
+    if (!nextReply) {
+      return;
+    }
+
+    setLastDebugMessage(
+      `Flushing queued avatar reply for transcript ${nextReply.transcriptId}.`
+    );
+    appendTranscript("avatar", nextReply.reply);
+    setLastChatReplyText(nextReply.reply);
+    await speakAsAvatar(nextReply.reply);
   }
 
   function appendTranscript(speaker: TranscriptEntry["speaker"], text: string) {
@@ -401,7 +380,7 @@ function BotOutputPage() {
       <div className={`output-overlay ${isStreamReady ? "output-overlay-live" : ""}`}>
         <p className="output-status">{statusMessage}</p>
         <p className="output-meta">Session: {String(sessionState)}</p>
-        <p className="output-meta">Transcript stream: Recall websocket</p>
+        <p className="output-meta">Transcript stream: Recall webhook via SSE</p>
         <p className="output-meta">Avatar speaking: {isAvatarTalking ? "yes" : "no"}</p>
         <p className="output-meta">Last event: {lastDebugMessage}</p>
         <p className="output-meta">Last heard: {lastTranscriptPreview}</p>
@@ -418,10 +397,12 @@ type RecallTranscriptSocketMessage = {
   event?: string;
   data?: {
     data?: {
-      words?: Array<{ text?: string }>;
-      start_timestamp?: {
-        relative?: number;
-      } | null;
+      words?: Array<{
+        text?: string;
+        start_timestamp?: {
+          relative?: number;
+        } | null;
+      }>;
       participant?: {
         id?: number | string;
         name?: string | null;
@@ -441,6 +422,18 @@ type RecallTranscriptSocketMessage = {
   };
 };
 
+type ChatReplyEvent = {
+  event: "chat.reply";
+  data: {
+    userText: string;
+    reply: string;
+    transcriptId: string;
+    participantName: string;
+  };
+};
+
+type StreamEvent = RecallTranscriptSocketMessage | ChatReplyEvent | { event: "ready" };
+
 function getTranscriptEvent(payload: RecallTranscriptSocketMessage) {
   const data = payload.data?.data;
   const transcript = payload.transcript;
@@ -453,7 +446,7 @@ function getTranscriptEvent(payload: RecallTranscriptSocketMessage) {
   const participantName = data?.participant?.name ?? transcript?.participant?.name ?? null;
   const transcriptId = payload.data?.transcript?.id ?? transcript?.id ?? null;
   const firstWordStart = words[0]?.start_timestamp?.relative ?? null;
-  const normalizedEvent = payload.event ?? "transcript.data";
+  const normalizedEvent = payload.event ?? "unknown";
   const fallbackKeyParts = [
     participantId ?? participantName ?? "unknown",
     firstWordStart ?? "na",
@@ -469,3 +462,5 @@ function getTranscriptEvent(payload: RecallTranscriptSocketMessage) {
     text
   };
 }
+
+type FinalTranscriptEvent = ReturnType<typeof getTranscriptEvent>;

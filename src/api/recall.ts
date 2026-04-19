@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { randomUUID } from "node:crypto";
 import { env } from "./config/env.js";
 
 const LaunchBotBodySchema = z.object({
@@ -7,6 +8,8 @@ const LaunchBotBodySchema = z.object({
 
 export async function launchRecallBot(input: unknown) {
   const { meetingUrl } = LaunchBotBodySchema.parse(input);
+  const launchId = randomUUID();
+  const publicAppUrl = env.PUBLIC_APP_URL.replace(/\/+$/, "");
 
   const response = await fetch(
     `https://${env.RECALL_REGION}.recall.ai/api/v1/bot/`,
@@ -23,7 +26,7 @@ export async function launchRecallBot(input: unknown) {
           camera: {
             kind: "webpage",
             config: {
-              url: `${env.PUBLIC_APP_URL}?output=1`
+              url: `${publicAppUrl}?output=1&launchId=${launchId}`
             }
           }
         },
@@ -36,6 +39,13 @@ export async function launchRecallBot(input: unknown) {
               }
             }
           },
+          realtime_endpoints: [
+            {
+              type: "webhook",
+              url: `${publicAppUrl}/api/recall-transcript?launchId=${launchId}`,
+              events: ["transcript.data", "transcript.partial_data"]
+            }
+          ],
           include_bot_in_recording: {
             audio: true
           }
@@ -51,5 +61,10 @@ export async function launchRecallBot(input: unknown) {
     throw new Error(`Recall bot launch failed: ${await response.text()}`);
   }
 
-  return response.json();
+  const bot = (await response.json()) as Record<string, unknown>;
+
+  return {
+    launchId,
+    ...bot
+  };
 }
