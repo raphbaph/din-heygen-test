@@ -8,7 +8,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { type TranscriptEntry } from "../shared/conversation";
 
 type JoinState = "idle" | "joining" | "joined" | "error";
-const FINAL_TRANSCRIPT_DEBOUNCE_MS = 850;
 const AVATAR_BOOTSTRAP_KEY = "__dinAvatarBootstrapState";
 
 type AvatarBootstrapState = "idle" | "bootstrapping" | "bootstrapped";
@@ -119,12 +118,10 @@ function BotOutputPage() {
   const sessionRef = useRef<LiveAvatarSession | null>(null);
   const recallTranscriptSocketRef = useRef<WebSocket | null>(null);
   const conversationIdRef = useRef(crypto.randomUUID());
-  const processedTranscriptIdsRef = useRef(new Set<string>());
+  const processedTranscriptKeysRef = useRef(new Set<string>());
   const ignoreTranscriptsUntilRef = useRef(0);
   const isAvatarTalkingRef = useRef(false);
   const isChatRequestPendingRef = useRef(false);
-  const pendingUtterancePartsRef = useRef<string[]>([]);
-  const pendingUtteranceTimerRef = useRef<number | null>(null);
 
   const [sessionState, setSessionState] = useState(SessionState.INACTIVE);
   const [isStreamReady, setIsStreamReady] = useState(false);
@@ -216,9 +213,6 @@ function BotOutputPage() {
 
     return () => {
       cancelled = true;
-      if (pendingUtteranceTimerRef.current !== null) {
-        window.clearTimeout(pendingUtteranceTimerRef.current);
-      }
       recallTranscriptSocketRef.current?.close();
       sessionRef.current?.removeAllListeners();
       if (sessionRef.current?.state === SessionState.CONNECTED) {
@@ -291,8 +285,18 @@ function BotOutputPage() {
       `${transcriptEvent.participantName ?? "unknown"}: ${transcriptEvent.text || "[empty]"}`
     );
 
-    if (transcriptEvent.id && processedTranscriptIdsRef.current.has(transcriptEvent.id)) {
-      setLastDebugMessage(`Ignored duplicate transcript ${transcriptEvent.id}.`);
+    if (transcriptEvent.event === "transcript.partial_data") {
+      setLastDebugMessage(`Observed partial transcript update for ${transcriptEvent.key}.`);
+      return;
+    }
+
+    if (transcriptEvent.event !== "transcript.data") {
+      setLastDebugMessage(`Ignored unsupported transcript event ${transcriptEvent.event}.`);
+      return;
+    }
+
+    if (processedTranscriptKeysRef.current.has(transcriptEvent.key)) {
+      setLastDebugMessage(`Ignored duplicate finalized transcript ${transcriptEvent.key}.`);
       return;
     }
 
@@ -312,11 +316,12 @@ function BotOutputPage() {
       return;
     }
 
-    if (transcriptEvent.id) {
-      processedTranscriptIdsRef.current.add(transcriptEvent.id);
-    }
-
-    queueFinalTranscriptChunk(text);
+    processedTranscriptKeysRef.current.add(transcriptEvent.key);
+    appendTranscript("user", text);
+    setLastDebugMessage(
+      `Accepted finalized transcript ${transcriptEvent.key}: "${text}"`
+    );
+    await requestAvatarReply(text);
   }
 
   async function speakAsAvatar(text: string) {
@@ -379,34 +384,6 @@ function BotOutputPage() {
     }
   }
 
-  function queueFinalTranscriptChunk(text: string) {
-    pendingUtterancePartsRef.current.push(text);
-    setLastDebugMessage(`Queued finalized transcript chunk: "${text}"`);
-
-    if (pendingUtteranceTimerRef.current !== null) {
-      window.clearTimeout(pendingUtteranceTimerRef.current);
-    }
-
-    pendingUtteranceTimerRef.current = window.setTimeout(() => {
-      pendingUtteranceTimerRef.current = null;
-      void flushPendingUtterance();
-    }, FINAL_TRANSCRIPT_DEBOUNCE_MS);
-  }
-
-  async function flushPendingUtterance() {
-    const combinedText = pendingUtterancePartsRef.current.join(" ").replace(/\s+/g, " ").trim();
-    pendingUtterancePartsRef.current = [];
-
-    if (!combinedText) {
-      setLastDebugMessage("Skipped empty combined transcript.");
-      return;
-    }
-
-    appendTranscript("user", combinedText);
-    setLastDebugMessage(`Finalized combined transcript sent: "${combinedText}"`);
-    await requestAvatarReply(combinedText);
-  }
-
   function appendTranscript(speaker: TranscriptEntry["speaker"], text: string) {
     setTranscript((current) => [
       ...current,
@@ -430,9 +407,6 @@ function BotOutputPage() {
         <p className="output-meta">Last heard: {lastTranscriptPreview}</p>
         <p className="output-meta">Last /api/chat input: {lastChatRequestText}</p>
         <p className="output-meta">Last avatar reply: {lastChatReplyText}</p>
-        <p className="output-meta">
-          Pending chunks: {pendingUtterancePartsRef.current.join(" | ") || "none"}
-        </p>
         <p className="output-meta">Transcript entries: {transcript.length}</p>
         {errorMessage ? <p className="error-line">{errorMessage}</p> : null}
       </div>
@@ -445,6 +419,9 @@ type RecallTranscriptSocketMessage = {
   data?: {
     data?: {
       words?: Array<{ text?: string }>;
+      start_timestamp?: {
+        relative?: number;
+      } | null;
       participant?: {
         id?: number | string;
         name?: string | null;
@@ -465,10 +442,6 @@ type RecallTranscriptSocketMessage = {
 };
 
 function getTranscriptEvent(payload: RecallTranscriptSocketMessage) {
-  if (payload.event && payload.event !== "transcript.data") {
-    return null;
-  }
-
   const data = payload.data?.data;
   const transcript = payload.transcript;
   const words = data?.words ?? transcript?.words ?? [];
@@ -476,10 +449,23 @@ function getTranscriptEvent(payload: RecallTranscriptSocketMessage) {
     .map((word) => word.text?.trim() ?? "")
     .filter(Boolean)
     .join(" ");
+  const participantId = data?.participant?.id ?? transcript?.participant?.id ?? null;
+  const participantName = data?.participant?.name ?? transcript?.participant?.name ?? null;
+  const transcriptId = payload.data?.transcript?.id ?? transcript?.id ?? null;
+  const firstWordStart = words[0]?.start_timestamp?.relative ?? null;
+  const normalizedEvent = payload.event ?? "transcript.data";
+  const fallbackKeyParts = [
+    participantId ?? participantName ?? "unknown",
+    firstWordStart ?? "na",
+    text
+  ];
+  const key = transcriptId ?? fallbackKeyParts.join(":");
 
   return {
-    id: payload.data?.transcript?.id ?? transcript?.id ?? text,
-    participantName: data?.participant?.name ?? transcript?.participant?.name ?? null,
+    event: normalizedEvent,
+    id: transcriptId,
+    key,
+    participantName,
     text
   };
 }
