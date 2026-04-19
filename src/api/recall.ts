@@ -28,6 +28,14 @@ export async function launchRecallBot(input: unknown) {
           }
         },
         recording_config: {
+          transcript: {
+            provider: {
+              recallai_streaming: {
+                mode: "prioritize_low_latency",
+                language_code: "en"
+              }
+            }
+          },
           include_bot_in_recording: {
             audio: true
           }

@@ -1,13 +1,13 @@
 # HeyGen Google Meet Test App
 
-This is a deliberately small test app for verifying a Recall bot can open a webpage, render a HeyGen LiveAvatar, join a Google Meet, and do one tiny branched conversation.
+This is a deliberately small test app for verifying a Recall bot can open a webpage, render a HeyGen LiveAvatar, join a Google Meet, and run a low-latency Anthropic-backed spoken conversation.
 
 ## What it does
 
 - Creates a HeyGen LiveAvatar session from your backend
 - Starts the avatar in the browser
 - Lets you paste a Google Meet URL and launch a Recall bot from a button
-- Uses browser speech recognition plus simple keyword matching for the back-and-forth
+- Uses Recall real-time transcription plus Anthropic for the back-and-forth
 
 ## Environment variables
 
@@ -17,6 +17,8 @@ Copy `.env.example` to `.env` and fill in:
 - `HEYGEN_AVATAR_ID`
 - `HEYGEN_AVATAR_VOICE_ID`
 - `HEYGEN_AVATAR_CONTEXT_ID`
+- `ANTHROPIC_API_KEY`
+- `ANTHROPIC_MODEL` such as `claude-sonnet-4-20250514`
 - `RECALL_API_KEY`
 - `RECALL_REGION`
 - `PUBLIC_APP_URL`
@@ -70,4 +72,5 @@ ngrok http 5173
 
 - The Recall bot is launched with `google_meet: "web_4_core"`.
 - The browser running inside the Recall bot should render this page as the bot camera feed.
-- Speech recognition depends on browser support. Chrome-based browsers are the safest choice for the operator page.
+- Recall real-time transcription is enabled with the `recallai_streaming` provider in low-latency mode.
+- Anthropic is called server-side using the Messages API at `https://api.anthropic.com/v1/messages`.

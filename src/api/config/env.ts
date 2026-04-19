@@ -9,6 +9,8 @@ export const env = z
     HEYGEN_AVATAR_ID: z.string().min(1),
     HEYGEN_AVATAR_VOICE_ID: z.string().min(1),
     HEYGEN_AVATAR_CONTEXT_ID: z.string().min(1),
+    ANTHROPIC_API_KEY: z.string().min(1),
+    ANTHROPIC_MODEL: z.string().min(1).default("claude-sonnet-4-20250514"),
     RECALL_API_KEY: z.string().min(1),
     RECALL_REGION: z.string().min(1),
     PUBLIC_APP_URL: z.string().url()

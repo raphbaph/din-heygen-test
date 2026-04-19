@@ -1,4 +1,5 @@
 import http from "node:http";
+import { createChatTurn } from "./chat.js";
 import { createHeyGenSession } from "./heygen.js";
 import { launchRecallBot } from "./recall.js";
 
@@ -9,8 +10,18 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
     if (req.method === "POST" && url.pathname === "/api/session") {
+      console.log("[heygen] /api/session requested");
       const session = await createHeyGenSession();
+      console.log("[heygen] /api/session created", {
+        sessionId: session.session_id
+      });
       return json(res, 200, session);
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/chat") {
+      const body = await readJsonBody(req);
+      const chatTurn = await createChatTurn(body);
+      return json(res, 200, chatTurn);
     }
 
     if (req.method === "POST" && url.pathname === "/api/join-meet") {

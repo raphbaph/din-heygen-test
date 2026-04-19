@@ -5,17 +5,19 @@ import {
   SessionState
 } from "@heygen/liveavatar-web-sdk";
 import { useEffect, useMemo, useRef, useState } from "react";
-import {
-  getIntroLine,
-  getNextReply,
-  initialConversationState,
-  type ConversationState,
-  type TranscriptEntry
-} from "../shared/conversation";
-
-const SPEECH_RECOGNITION_GAP_MS = 800;
+import { type TranscriptEntry } from "../shared/conversation";
 
 type JoinState = "idle" | "joining" | "joined" | "error";
+const FINAL_TRANSCRIPT_DEBOUNCE_MS = 850;
+const AVATAR_BOOTSTRAP_KEY = "__dinAvatarBootstrapState";
+
+type AvatarBootstrapState = "idle" | "bootstrapping" | "bootstrapped";
+
+declare global {
+  interface Window {
+    __dinAvatarBootstrapState?: AvatarBootstrapState;
+  }
+}
 
 export default function App() {
   const isOutputMode = useMemo(
@@ -115,10 +117,14 @@ function OperatorPage() {
 function BotOutputPage() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const sessionRef = useRef<LiveAvatarSession | null>(null);
-  const recognitionRef = useRef<SpeechRecognition | null>(null);
-  const finalizedTextTimerRef = useRef<number | null>(null);
-  const introDeliveredRef = useRef(false);
-  const shouldRestartRecognitionRef = useRef(true);
+  const recallTranscriptSocketRef = useRef<WebSocket | null>(null);
+  const conversationIdRef = useRef(crypto.randomUUID());
+  const processedTranscriptIdsRef = useRef(new Set<string>());
+  const ignoreTranscriptsUntilRef = useRef(0);
+  const isAvatarTalkingRef = useRef(false);
+  const isChatRequestPendingRef = useRef(false);
+  const pendingUtterancePartsRef = useRef<string[]>([]);
+  const pendingUtteranceTimerRef = useRef<number | null>(null);
 
   const [sessionState, setSessionState] = useState(SessionState.INACTIVE);
   const [isStreamReady, setIsStreamReady] = useState(false);
@@ -126,22 +132,24 @@ function BotOutputPage() {
   const [statusMessage, setStatusMessage] = useState("Waiting to initialize avatar session.");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
-  const [conversationState, setConversationState] =
-    useState<ConversationState>(initialConversationState);
-
-  const speechRecognitionSupported = useMemo(
-    () => Boolean(window.SpeechRecognition || window.webkitSpeechRecognition),
-    []
-  );
+  const [lastTranscriptPreview, setLastTranscriptPreview] = useState("None yet.");
+  const [lastChatRequestText, setLastChatRequestText] = useState("None yet.");
+  const [lastChatReplyText, setLastChatReplyText] = useState("None yet.");
+  const [lastDebugMessage, setLastDebugMessage] = useState("Booting.");
 
   useEffect(() => {
+    const bootstrapState = window[AVATAR_BOOTSTRAP_KEY];
+    if (bootstrapState === "bootstrapping" || bootstrapState === "bootstrapped") {
+      setLastDebugMessage(`Skipped duplicate bootstrap: ${bootstrapState}.`);
+      return;
+    }
+
+    window[AVATAR_BOOTSTRAP_KEY] = "bootstrapping";
     let cancelled = false;
 
     async function bootstrap() {
       try {
-        setStatusMessage("Requesting microphone access.");
-        await navigator.mediaDevices.getUserMedia({ audio: true });
-
+        setLastDebugMessage("Requesting HeyGen session token.");
         setStatusMessage("Creating HeyGen session.");
         const response = await fetch("/api/session", { method: "POST" });
         if (!response.ok) {
@@ -163,32 +171,44 @@ function BotOutputPage() {
         });
 
         sessionRef.current = session;
+        setLastDebugMessage("HeyGen session token received.");
 
         session.on(SessionEvent.SESSION_STATE_CHANGED, (nextState) => {
           setSessionState(nextState);
+          setLastDebugMessage(`HeyGen session state changed to ${String(nextState)}.`);
         });
         session.on(SessionEvent.SESSION_STREAM_READY, () => {
           setIsStreamReady(true);
           setStatusMessage("Avatar stream ready.");
+          setLastDebugMessage("HeyGen avatar stream ready.");
         });
         session.on(AgentEventsEnum.AVATAR_SPEAK_STARTED, () => {
+          isAvatarTalkingRef.current = true;
+          ignoreTranscriptsUntilRef.current = Date.now() + 1500;
           setIsAvatarTalking(true);
         });
         session.on(AgentEventsEnum.AVATAR_SPEAK_ENDED, () => {
+          isAvatarTalkingRef.current = false;
+          ignoreTranscriptsUntilRef.current = Date.now() + 1500;
           setIsAvatarTalking(false);
         });
 
         setStatusMessage("Starting avatar stream.");
+        setLastDebugMessage("Starting HeyGen avatar session.");
         await session.start();
         if (videoRef.current) {
           session.attach(videoRef.current);
+          setLastDebugMessage("HeyGen avatar attached to video element.");
         }
 
+        window[AVATAR_BOOTSTRAP_KEY] = "bootstrapped";
         setStatusMessage("Avatar ready. Launch a Meet when you want.");
       } catch (error) {
         console.error(error);
+        window[AVATAR_BOOTSTRAP_KEY] = "idle";
         setErrorMessage(error instanceof Error ? error.message : "Failed to initialize avatar.");
         setStatusMessage("Avatar setup failed.");
+        setLastDebugMessage("HeyGen bootstrap failed.");
       }
     }
 
@@ -196,15 +216,14 @@ function BotOutputPage() {
 
     return () => {
       cancelled = true;
-      shouldRestartRecognitionRef.current = false;
-
-      if (finalizedTextTimerRef.current !== null) {
-        window.clearTimeout(finalizedTextTimerRef.current);
+      if (pendingUtteranceTimerRef.current !== null) {
+        window.clearTimeout(pendingUtteranceTimerRef.current);
       }
-
-      recognitionRef.current?.stop();
+      recallTranscriptSocketRef.current?.close();
       sessionRef.current?.removeAllListeners();
-      void sessionRef.current?.stop();
+      if (sessionRef.current?.state === SessionState.CONNECTED) {
+        void sessionRef.current.stop();
+      }
     };
   }, []);
 
@@ -217,111 +236,175 @@ function BotOutputPage() {
   }, [isStreamReady]);
 
   useEffect(() => {
-    if (!isStreamReady || introDeliveredRef.current || !sessionRef.current) {
+    if (!isStreamReady) {
       return;
     }
 
-    introDeliveredRef.current = true;
-    void speakAsAvatar(getIntroLine());
-    setConversationState({ stage: "waiting_for_interest" });
-  }, [isStreamReady]);
+    const socket = new WebSocket("wss://meeting-data.bot.recall.ai/api/v1/transcript");
+    recallTranscriptSocketRef.current = socket;
 
-  useEffect(() => {
-    if (!speechRecognitionSupported || !isStreamReady) {
-      return;
-    }
-
-    const Recognition =
-      window.SpeechRecognition ?? window.webkitSpeechRecognition;
-
-    if (!Recognition) {
-      return;
-    }
-
-    const recognition = new Recognition();
-    recognition.continuous = true;
-    recognition.interimResults = false;
-    recognition.lang = "en-US";
-
-    recognition.onresult = (event) => {
-      const latestResult = event.results[event.results.length - 1];
-      if (!latestResult?.isFinal) {
-        return;
-      }
-
-      const latestText = latestResult[0]?.transcript?.trim();
-      if (!latestText) {
-        return;
-      }
-
-      if (finalizedTextTimerRef.current !== null) {
-        window.clearTimeout(finalizedTextTimerRef.current);
-      }
-
-      finalizedTextTimerRef.current = window.setTimeout(() => {
-        void handleUserUtterance(latestText);
-      }, SPEECH_RECOGNITION_GAP_MS);
+    socket.onopen = () => {
+      setStatusMessage("Waiting for finalized speech from the meeting.");
+      setLastDebugMessage("Recall transcript websocket connected.");
     };
 
-    recognition.onerror = (event) => {
-      console.error("Speech recognition error", event.error, event.message);
+    socket.onmessage = (event) => {
+      void handleTranscriptEvent(event.data);
     };
 
-    recognition.onend = () => {
-      if (shouldRestartRecognitionRef.current) {
-        try {
-          recognition.start();
-        } catch (error) {
-          console.error("Speech recognition restart failed", error);
-        }
+    socket.onerror = () => {
+      setErrorMessage("Recall transcript stream failed.");
+      setStatusMessage("Recall transcript stream failed.");
+      setLastDebugMessage("Recall transcript websocket error.");
+    };
+
+    socket.onclose = () => {
+      if (recallTranscriptSocketRef.current === socket) {
+        recallTranscriptSocketRef.current = null;
       }
     };
-
-    recognitionRef.current = recognition;
-
-    try {
-      recognition.start();
-      setStatusMessage("Listening for speech from the meeting.");
-    } catch (error) {
-      console.error("Speech recognition start failed", error);
-    }
 
     return () => {
-      recognition.stop();
-      recognitionRef.current = null;
+      if (recallTranscriptSocketRef.current === socket) {
+        recallTranscriptSocketRef.current = null;
+      }
+      socket.close();
     };
-  }, [isStreamReady, speechRecognitionSupported]);
+  }, [isStreamReady]);
 
-  async function handleUserUtterance(text: string) {
-    appendTranscript("user", text);
+  async function handleTranscriptEvent(rawMessage: string) {
+    let payload: RecallTranscriptSocketMessage;
 
-    const next = getNextReply(conversationState, text);
-    if (!next) {
+    try {
+      payload = JSON.parse(rawMessage) as RecallTranscriptSocketMessage;
+    } catch (error) {
+      console.error("Recall transcript payload parse failed", error);
       return;
     }
 
-    setConversationState(next.nextState);
-    await speakAsAvatar(next.reply);
+    const transcriptEvent = getTranscriptEvent(payload);
+    if (!transcriptEvent) {
+      return;
+    }
+
+    setLastTranscriptPreview(
+      `${transcriptEvent.participantName ?? "unknown"}: ${transcriptEvent.text || "[empty]"}`
+    );
+
+    if (transcriptEvent.id && processedTranscriptIdsRef.current.has(transcriptEvent.id)) {
+      setLastDebugMessage(`Ignored duplicate transcript ${transcriptEvent.id}.`);
+      return;
+    }
+
+    if (isAvatarTalkingRef.current || isChatRequestPendingRef.current) {
+      setLastDebugMessage("Ignored transcript while avatar was speaking or request was pending.");
+      return;
+    }
+
+    if (Date.now() < ignoreTranscriptsUntilRef.current) {
+      setLastDebugMessage("Ignored transcript during post-speech cooldown window.");
+      return;
+    }
+
+    const text = transcriptEvent.text.trim();
+    if (!text) {
+      setLastDebugMessage("Ignored empty finalized transcript.");
+      return;
+    }
+
+    if (transcriptEvent.id) {
+      processedTranscriptIdsRef.current.add(transcriptEvent.id);
+    }
+
+    queueFinalTranscriptChunk(text);
   }
 
   async function speakAsAvatar(text: string) {
     appendTranscript("avatar", text);
+    setLastChatReplyText(text);
 
     const session = sessionRef.current;
     if (!session) {
+      setLastDebugMessage("Avatar session was missing before speak.");
       return;
     }
 
     setStatusMessage("Avatar speaking.");
 
     try {
+      ignoreTranscriptsUntilRef.current = Date.now() + 1500;
+      setLastDebugMessage("Sending text to HeyGen avatar.");
       session.repeat(text);
     } catch (error) {
       console.error("Avatar speak failed", error);
       setErrorMessage(error instanceof Error ? error.message : "Avatar failed to speak.");
+      setLastDebugMessage("HeyGen avatar speak failed.");
     } finally {
-      setStatusMessage("Listening for speech from the meeting.");
+      setStatusMessage("Waiting for finalized speech from the meeting.");
     }
+  }
+
+  async function requestAvatarReply(text: string) {
+    isChatRequestPendingRef.current = true;
+    setStatusMessage("Thinking about a reply.");
+    setLastChatRequestText(text);
+    setLastDebugMessage("Sending transcript to /api/chat.");
+
+    try {
+      const response = await fetch("/api/chat", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          conversationId: conversationIdRef.current,
+          text
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+
+      const payload = (await response.json()) as { reply: string };
+      setLastDebugMessage("Received reply from /api/chat.");
+      await speakAsAvatar(payload.reply);
+    } catch (error) {
+      console.error("Chat request failed", error);
+      setErrorMessage(error instanceof Error ? error.message : "Chat request failed.");
+      setLastDebugMessage("Chat request failed.");
+      await speakAsAvatar("I missed part of that. Please say it once more.");
+    } finally {
+      isChatRequestPendingRef.current = false;
+    }
+  }
+
+  function queueFinalTranscriptChunk(text: string) {
+    pendingUtterancePartsRef.current.push(text);
+    setLastDebugMessage(`Queued finalized transcript chunk: "${text}"`);
+
+    if (pendingUtteranceTimerRef.current !== null) {
+      window.clearTimeout(pendingUtteranceTimerRef.current);
+    }
+
+    pendingUtteranceTimerRef.current = window.setTimeout(() => {
+      pendingUtteranceTimerRef.current = null;
+      void flushPendingUtterance();
+    }, FINAL_TRANSCRIPT_DEBOUNCE_MS);
+  }
+
+  async function flushPendingUtterance() {
+    const combinedText = pendingUtterancePartsRef.current.join(" ").replace(/\s+/g, " ").trim();
+    pendingUtterancePartsRef.current = [];
+
+    if (!combinedText) {
+      setLastDebugMessage("Skipped empty combined transcript.");
+      return;
+    }
+
+    appendTranscript("user", combinedText);
+    setLastDebugMessage(`Finalized combined transcript sent: "${combinedText}"`);
+    await requestAvatarReply(combinedText);
   }
 
   function appendTranscript(speaker: TranscriptEntry["speaker"], text: string) {
@@ -338,15 +421,65 @@ function BotOutputPage() {
   return (
     <main className="output-shell">
       <video className="output-video" ref={videoRef} autoPlay playsInline muted={false} />
-      {!isStreamReady ? (
-        <div className="output-overlay">
-          <p className="output-status">{statusMessage}</p>
-          <p className="output-meta">Session: {String(sessionState)}</p>
-          <p className="output-meta">Speech recognition: {speechRecognitionSupported ? "on" : "off"}</p>
-          <p className="output-meta">Avatar speaking: {isAvatarTalking ? "yes" : "no"}</p>
-          {errorMessage ? <p className="error-line">{errorMessage}</p> : null}
-        </div>
-      ) : null}
+      <div className={`output-overlay ${isStreamReady ? "output-overlay-live" : ""}`}>
+        <p className="output-status">{statusMessage}</p>
+        <p className="output-meta">Session: {String(sessionState)}</p>
+        <p className="output-meta">Transcript stream: Recall websocket</p>
+        <p className="output-meta">Avatar speaking: {isAvatarTalking ? "yes" : "no"}</p>
+        <p className="output-meta">Last event: {lastDebugMessage}</p>
+        <p className="output-meta">Last heard: {lastTranscriptPreview}</p>
+        <p className="output-meta">Last /api/chat input: {lastChatRequestText}</p>
+        <p className="output-meta">Last avatar reply: {lastChatReplyText}</p>
+        <p className="output-meta">
+          Pending chunks: {pendingUtterancePartsRef.current.join(" | ") || "none"}
+        </p>
+        <p className="output-meta">Transcript entries: {transcript.length}</p>
+        {errorMessage ? <p className="error-line">{errorMessage}</p> : null}
+      </div>
     </main>
   );
+}
+
+type RecallTranscriptSocketMessage = {
+  event?: string;
+  data?: {
+    data?: {
+      words?: Array<{ text?: string }>;
+      participant?: {
+        id?: number | string;
+        name?: string | null;
+      };
+    };
+    transcript?: {
+      id?: string;
+    };
+  };
+  transcript?: {
+    words?: Array<{ text?: string }>;
+    participant?: {
+      id?: number | string;
+      name?: string | null;
+    };
+    id?: string;
+  };
+};
+
+function getTranscriptEvent(payload: RecallTranscriptSocketMessage) {
+  if (payload.event && payload.event !== "transcript.data") {
+    return null;
+  }
+
+  const data = payload.data?.data;
+  const transcript = payload.transcript;
+  const words = data?.words ?? transcript?.words ?? [];
+  const text = words
+    .map((word) => word.text?.trim() ?? "")
+    .filter(Boolean)
+    .join(" ");
+
+  return {
+    id: payload.data?.transcript?.id ?? transcript?.id ?? text,
+    participantName: data?.participant?.name ?? transcript?.participant?.name ?? null,
+    text
+  };
 }

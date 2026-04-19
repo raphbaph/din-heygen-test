@@ -66,6 +66,18 @@ button {
   background: rgba(0, 0, 0, 0.58);
 }
 
+.output-overlay-live {
+  inset: auto 16px 16px 16px;
+  place-content: initial;
+  justify-items: start;
+  gap: 4px;
+  max-width: min(760px, calc(100vw - 32px));
+  padding: 14px 16px;
+  text-align: left;
+  border-radius: 16px;
+  background: rgba(0, 0, 0, 0.72);
+}
+
 .output-status {
   margin: 0;
   font-size: 1.05rem;
